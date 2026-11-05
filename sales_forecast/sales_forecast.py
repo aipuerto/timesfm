@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """TimesFM 2.5 ile satış serisi tahmini (bölge / müşteri / ürün bazında).
 
-Girdi CSV (uzun format):   date,series,value
-    2024-01-31,Latin America,125000
-    2024-01-31,Africa,98000
-Tek seri ise `series` sütunu olmadan da çalışır:   date,value
+Girdi: CSV veya Excel (.xlsx), iki formattan biri:
+  1) Uzun:  date,series,value
+        2024-01-31,Latin America,125000
+        2024-01-31,Africa,98000
+     (`series` sütunu yoksa tek seri varsayılır)
+  2) Geniş: ilk sütun seri/firma adı, diğer sütun başlıkları yıl veya tarih
+        Firma,2023,2024,2025,2026
+     'Genel Toplam' gibi özet satırlar otomatik çıkarılır.
 
 Çıktı: forecast.csv  (series, date, p10, p50, p90, mean)
        backtest.csv  (--backtest N verilirse: seri başına MAPE / sMAPE)
@@ -17,6 +21,7 @@ Tek seri ise `series` sütunu olmadan da çalışır:   date,value
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -28,26 +33,80 @@ MODEL_ID = "google/timesfm-2.5-200m-pytorch"
 Q_MEAN, Q10, Q50, Q90 = 0, 1, 5, 9
 
 
-def load_series(path: str, date_col: str, value_col: str,
-                series_col: str | None, freq: str) -> dict[str, pd.Series]:
-    df = pd.read_csv(path)
-    for col in (date_col, value_col):
-        if col not in df.columns:
-            sys.exit(f"CSV'de '{col}' sütunu yok. Mevcut sütunlar: {list(df.columns)}")
-    df[date_col] = pd.to_datetime(df[date_col])
-    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
+TOTAL_ROW = re.compile(r"^\s*(genel\s*toplam|toplam|grand\s*total|total)\s*$", re.I)
 
-    if series_col and series_col in df.columns:
-        groups = {str(k): g for k, g in df.groupby(series_col)}
-    else:
-        groups = {"toplam": df}
+
+def read_table(path: str, sheet: str | int) -> pd.DataFrame:
+    if Path(path).suffix.lower() in (".xlsx", ".xlsm", ".xls"):
+        return pd.read_excel(path, sheet_name=sheet)
+    return pd.read_csv(path)
+
+
+def _as_period_start(col) -> pd.Timestamp | None:
+    """Sütun başlığı yıl (2024 / 2024.0) veya tarih ise Timestamp döndür."""
+    try:
+        f = float(col)
+        if f.is_integer() and 1900 <= f <= 2200:
+            return pd.Timestamp(year=int(f), month=1, day=1)
+        return None
+    except (TypeError, ValueError):
+        pass
+    try:
+        return pd.Timestamp(col)
+    except (ValueError, TypeError):
+        return None
+
+
+def to_long(df: pd.DataFrame, date_col: str, value_col: str,
+            series_col: str) -> pd.DataFrame:
+    """Uzun (date, series, value) veya geniş (ilk sütun = seri adı, diğer
+    sütunlar = yıl/tarih) formatı uzun formata çevir."""
+    if date_col in df.columns and value_col in df.columns:
+        out = df.copy()
+        if series_col not in out.columns:
+            out[series_col] = "toplam"
+        return out[[date_col, series_col, value_col]].rename(
+            columns={date_col: "date", series_col: "series", value_col: "value"})
+
+    name_col = df.columns[0]
+    period_cols = {c: _as_period_start(c) for c in df.columns[1:]}
+    period_cols = {c: p for c, p in period_cols.items() if p is not None}
+    if not period_cols:
+        sys.exit("Format tanınmadı. Ya '%s','%s' sütunları olmalı ya da ilk sütun "
+                 "seri adı, diğerleri yıl/tarih başlıklı olmalı. Sütunlar: %s"
+                 % (date_col, value_col, list(df.columns)))
+    long = df.melt(id_vars=name_col, value_vars=list(period_cols),
+                   var_name="date", value_name="value")
+    long["date"] = long["date"].map(period_cols)
+    return long.rename(columns={name_col: "series"})[["date", "series", "value"]]
+
+
+def load_series(path: str, date_col: str, value_col: str, series_col: str,
+                freq: str, sheet: str | int = 0, add_total: bool = False,
+                last_fraction: float = 1.0) -> dict[str, pd.Series]:
+    long = to_long(read_table(path, sheet), date_col, value_col, series_col)
+    long["date"] = pd.to_datetime(long["date"])
+    long["value"] = pd.to_numeric(long["value"], errors="coerce")
+    long["series"] = long["series"].astype(str)
+
+    # 'Genel Toplam' gibi özet satırlar çift saymaya yol açar
+    is_total = long["series"].map(lambda x: bool(TOTAL_ROW.match(x)))
+    if is_total.any():
+        print("Özet satır(lar) çıkarıldı: %s" % sorted(long.loc[is_total, "series"].unique()))
+    long = long[~is_total]
 
     out = {}
-    for name, g in groups.items():
-        # Aynı döneme düşen satırları topla, eksik dönemleri 0 ile doldur
-        s = (g.set_index(date_col)[value_col].resample(freq).sum(min_count=1))
-        s = s.fillna(0.0)
-        out[name] = s
+    for name, g in long.groupby("series", sort=False):
+        s = g.set_index("date")["value"].resample(freq).sum(min_count=1)
+        s = s.loc[s.first_valid_index():]   # ilk satıştan önceki boşluklar silinir
+        out[name] = s.fillna(0.0)           # sonraki boşluklar = satış yok (0)
+
+    if add_total:
+        out["TOPLAM (hesaplanan)"] = pd.concat(out.values(), axis=1).sum(axis=1)
+
+    if last_fraction < 1.0:  # son dönem eksikse (örn. yılın %85'i) yıllıklandır
+        for s in out.values():
+            s.iloc[-1] = s.iloc[-1] / last_fraction
     return out
 
 
@@ -94,9 +153,28 @@ def main() -> None:
                     help="Son N dönemi saklayıp modeli bunlar üzerinde sına")
     ap.add_argument("--max-context", type=int, default=512)
     ap.add_argument("--out-dir", default="out")
+    ap.add_argument("--sheet", default=0, help="Excel sayfa adı veya sırası (varsayılan: ilk sayfa)")
+    ap.add_argument("--add-total", action="store_true",
+                    help="Tüm serilerin toplamını da ayrı seri olarak tahmin et")
+    ap.add_argument("--last-fraction", type=float, default=1.0,
+                    help="Son dönemin tamamlanma oranı (0-1). Örn. yıl %%85 bittiyse 0.85: "
+                         "son değer yıllıklandırılır")
+    ap.add_argument("--min-history", type=int, default=8,
+                    help="Bundan kısa geçmişi olan seriler atlanır (TimesFM kısa seride güvenilmez)")
     args = ap.parse_args()
 
-    series = load_series(args.csv, args.date_col, args.value_col, args.series_col, args.freq)
+    sheet = int(args.sheet) if str(args.sheet).isdigit() else args.sheet
+    series = load_series(args.csv, args.date_col, args.value_col, args.series_col,
+                         args.freq, sheet, args.add_total, args.last_fraction)
+
+    skipped = {nm: len(s) for nm, s in series.items() if len(s) < args.min_history}
+    series = {nm: s for nm, s in series.items() if len(s) >= args.min_history}
+    if skipped:
+        print("Atlandı (geçmiş < %d dönem): %d seri" % (args.min_history, len(skipped)))
+    if not series:
+        longest = max(skipped.values(), default=0)
+        sys.exit("Tahmin edilecek seri kalmadı (en uzun geçmiş: %d dönem). Daha sık veri "
+                 "(ör. aylık) kullan veya --min-history değerini düşür." % longest)
     names = list(series)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
