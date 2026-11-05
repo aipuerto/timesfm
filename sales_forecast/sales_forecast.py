@@ -9,6 +9,10 @@ Girdi: CSV veya Excel (.xlsx), iki formattan biri:
   2) Geniş: ilk sütun seri/firma adı, diğer sütun başlıkları yıl veya tarih
         Firma,2023,2024,2025,2026
      'Genel Toplam' gibi özet satırlar otomatik çıkarılır.
+  3) Ay bloğu: ay adı satırı (ay toplamı), altında o ayın firmaları; sütunlar yıl
+        Ocak,   140051, 197791   <- ay toplamı (veriye katılmaz)
+        EUROFLEX, 41499,  67288  <- o ayın firma satırı
+     Dolu olan son ay otomatik bulunur; boş gelecek aylar sıfır sayılmaz.
 
 Çıktı: forecast.csv  (series, date, p10, p50, p90, mean)
        backtest.csv  (--backtest N verilirse: seri başına MAPE / sMAPE)
@@ -34,6 +38,41 @@ Q_MEAN, Q10, Q50, Q90 = 0, 1, 5, 9
 
 
 TOTAL_ROW = re.compile(r"^\s*(genel\s*toplam|toplam|grand\s*total|total)\s*$", re.I)
+
+
+MONTHS = {m: i + 1 for i, m in enumerate(
+    ["ocak", "şubat", "mart", "nisan", "mayıs", "haziran",
+     "temmuz", "ağustos", "eylül", "ekim", "kasım", "aralık"])}
+MONTHS.update({m: i + 1 for i, m in enumerate(
+    ["january", "february", "march", "april", "may", "june",
+     "july", "august", "september", "october", "november", "december"])})
+
+
+def _month_no(x) -> int | None:
+    return MONTHS.get(str(x).strip().lower())
+
+
+def block_to_long(df: pd.DataFrame) -> pd.DataFrame:
+    """Ay bloğu düzeni: ay adı satırı (ay toplamı), altında o ayın firma satırları;
+    sütunlar yıl. Ay satırları ve toplam satırları veriye katılmaz."""
+    name_col = df.columns[0]
+    years = {}
+    for c in df.columns[1:]:
+        p = _as_period_start(c)
+        if p is not None:
+            years[c] = p.year
+    rows, cur = [], None
+    for _, r in df.iterrows():
+        nm = str(r[name_col]).strip()
+        m = _month_no(nm)
+        if m:
+            cur = m
+            continue
+        if cur is None or TOTAL_ROW.match(nm):
+            continue
+        for c, y in years.items():
+            rows.append((pd.Timestamp(year=y, month=cur, day=1), nm, r[c]))
+    return pd.DataFrame(rows, columns=["date", "series", "value"])
 
 
 def read_table(path: str, sheet: str | int) -> pd.DataFrame:
@@ -69,6 +108,8 @@ def to_long(df: pd.DataFrame, date_col: str, value_col: str,
             columns={date_col: "date", series_col: "series", value_col: "value"})
 
     name_col = df.columns[0]
+    if df[name_col].map(_month_no).notna().sum() >= 6:
+        return block_to_long(df)
     period_cols = {c: _as_period_start(c) for c in df.columns[1:]}
     period_cols = {c: p for c, p in period_cols.items() if p is not None}
     if not period_cols:
@@ -95,11 +136,20 @@ def load_series(path: str, date_col: str, value_col: str, series_col: str,
         print("Özet satır(lar) çıkarıldı: %s" % sorted(long.loc[is_total, "series"].unique()))
     long = long[~is_total]
 
+    # Verinin gerçekten dolu olduğu son dönem (boş hücreler dönem sayılmaz)
+    last_obs = long.loc[long["value"].notna(), "date"].max()
+    print("Verinin son dolu dönemi: %s" % last_obs.date())
+
     out = {}
     for name, g in long.groupby("series", sort=False):
+        g = g.dropna(subset=["value"])      # boş hücre = veri yok, dönem sayılmaz
+        if g.empty:
+            continue
         s = g.set_index("date")["value"].resample(freq).sum(min_count=1)
         s = s.loc[s.first_valid_index():]   # ilk satıştan önceki boşluklar silinir
-        out[name] = s.fillna(0.0)           # sonraki boşluklar = satış yok (0)
+        # Satışı durmuş firma da ortak son döneme kadar 0 olarak devam etmeli
+        idx = pd.date_range(s.index[0], max(last_obs, s.index[-1]), freq=freq)
+        out[name] = s.reindex(idx).fillna(0.0)  # aradaki/sondaki boşluklar = satış yok
 
     if add_total:
         out["TOPLAM (hesaplanan)"] = pd.concat(out.values(), axis=1).sum(axis=1)

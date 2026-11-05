@@ -1,0 +1,5 @@
+# Müşteri/satış verisi ve çıktıları repoya girmesin (fork herkese açık)
+*.csv
+*.xlsx
+*.xls
+out/
